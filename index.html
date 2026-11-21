@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Multiplayer</title>
+<style>
+  :root { --bg:#111; --panel:#1c1c1c; --fg:#eee; --muted:#888; --accent:#3b82f6; --err:#f87171; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px system-ui, sans-serif; }
+  form { display:flex; flex-wrap:wrap; gap:8px; padding:12px; background:var(--panel); position:sticky; top:0; z-index:1; }
+  input, select, button { font:inherit; padding:6px 10px; border-radius:4px; border:1px solid #333; background:#000; color:var(--fg); }
+  input[type=url] { flex:1 1 320px; }
+  input[name=version] { width:110px; }
+  button { cursor:pointer; background:var(--accent); border-color:var(--accent); }
+  button.ghost { background:transparent; border-color:#444; }
+  #grid { display:grid; grid-template-columns:repeat(var(--cols,1), 1fr); gap:4px; padding:4px; }
+  .tile { position:relative; background:#000; aspect-ratio:16/9; }
+  .tile iframe { width:100%; height:100%; display:block; border:0; }
+  .tile header { position:absolute; inset:0 0 auto 0; display:flex; gap:8px; align-items:center; padding:4px 8px;
+                 background:linear-gradient(#000c, #0000); font-size:12px; opacity:0; transition:opacity .2s; z-index:1; }
+  .tile:hover header { opacity:1; }
+  .tile header b { color:var(--accent); white-space:nowrap; }
+  .tile header span { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--muted); }
+  .tile header button { padding:0 8px; background:#0008; border-color:#555; }
+  #empty { color:var(--muted); text-align:center; padding:60px 16px; }
+</style>
+</head>
+<body>
+<form id="add">
+  <input type="url" name="url" placeholder="Manifest URL (.m3u8 / .mpd / .mp4)" required>
+  <select name="player" aria-label="Player"><option value="auto">Auto</option></select>
+  <input name="version" list="versions" aria-label="Version" placeholder="default">
+  <datalist id="versions"></datalist>
+  <button>Add</button>
+  <button type="button" class="ghost" id="playAll">Play all</button>
+  <button type="button" class="ghost" id="pauseAll">Pause all</button>
+  <button type="button" class="ghost" id="muteAll">Mute all</button>
+  <button type="button" class="ghost" id="syncAll" title="Align every tile to the first one">Sync</button>
+</form>
+<div id="grid"></div>
+<p id="empty">Add a stream above. The page URL is shareable: it holds the whole layout.</p>
+
+<script src="players.js"></script>
+<script>
+const pickPlayer = url => Object.keys(PLAYERS).find(k => PLAYERS[k].match?.test(url)) ?? 'native';
+
+const grid = document.getElementById('grid');
+const tiles = []; // { key, version, url }
+
+function addTile(url, key, version) {
+  if (key === 'auto' || !PLAYERS[key]) key = pickPlayer(url);
+  const p = PLAYERS[key];
+  version ||= p.version || '';
+  const t = { key, version, url };
+
+  const el = document.createElement('div');
+  el.className = 'tile';
+  el.innerHTML = `<header><b></b><span></span><button title="Reload">↻</button><button title="Remove">✕</button></header>
+                  <iframe allow="autoplay; fullscreen; encrypted-media; picture-in-picture" allowfullscreen></iframe>`;
+  el.querySelector('b').textContent = `${p.label} ${version}`;
+  el.querySelector('span').textContent = el.querySelector('span').title = url;
+  const frame = el.querySelector('iframe');
+  frame.src = 'player.html?' + new URLSearchParams({ player: key, v: version, url });
+
+  const [reload, remove] = el.querySelectorAll('header button');
+  reload.onclick = () => frame.contentWindow.location.reload();
+  remove.onclick = () => { el.remove(); tiles.splice(tiles.indexOf(t), 1); sync(); };
+
+  grid.append(el); tiles.push(t); sync();
+}
+
+// URL state: #s=hlsjs@1.7.4|https://...&s=shaka@4.12.0|https://...
+function sync() {
+  const q = new URLSearchParams();
+  tiles.forEach(t => q.append('s', `${t.key}@${t.version}|${t.url}`));
+  history.replaceState(null, '', '#' + q);
+  grid.style.setProperty('--cols', Math.ceil(Math.sqrt(tiles.length)) || 1); // 1, 2x2, 3x3...
+  document.getElementById('empty').hidden = tiles.length > 0;
+}
+
+const form = document.getElementById('add');
+for (const [k, p] of Object.entries(PLAYERS)) form.player.add(new Option(p.label, k));
+
+// Fill the version suggestions from jsdelivr when a player is picked.
+form.player.onchange = async () => {
+  const p = PLAYERS[form.player.value];
+  const list = document.getElementById('versions');
+  form.version.value = ''; form.version.placeholder = p?.version || 'default'; list.innerHTML = '';
+  if (!p?.npm) return;
+  try {
+    const { versions } = await (await fetch(`https://data.jsdelivr.com/v1/packages/npm/${p.npm}`)).json();
+    list.append(...versions.map(v => new Option(v.version)));
+  } catch {}
+};
+
+form.onsubmit = e => {
+  e.preventDefault();
+  addTile(form.url.value.trim(), form.player.value, form.version.value.trim());
+  form.url.value = '';
+};
+const videos = () => [...grid.querySelectorAll('iframe')].map(f => f.contentDocument?.querySelector('video')).filter(Boolean);
+document.getElementById('playAll').onclick = () => videos().forEach(v => v.play().catch(() => {}));
+document.getElementById('pauseAll').onclick = () => videos().forEach(v => v.pause());
+document.getElementById('muteAll').onclick = () => videos().forEach(v => v.muted = true);
+
+// Sync: pause all, seek, wait for the seeks, play together. Two groups:
+// - tiles with a playhead date (live, same content): align on wall clock to the one furthest
+//   behind, so everyone seeks backwards (seeking past a player's live edge gets clamped)
+// - the rest (VOD): align on currentTime to the first such tile
+document.getElementById('syncAll').onclick = async () => {
+  const wins = [...grid.querySelectorAll('iframe')].map(f => f.contentWindow).filter(w => w?.playheadDate);
+  if (wins.length < 2) return;
+  const vids = wins.map(w => w.document.querySelector('video'));
+  vids.forEach(v => v.pause());
+  const dates = wins.map(w => { const d = w.playheadDate(); return d > 1e12 ? +d : null; }); // drop missing / 1970 dates
+  const minDate = Math.min(...dates.filter(Boolean));
+  const vodRef = vids.find((v, i) => !dates[i])?.currentTime;
+  await Promise.all(vids.map((v, i) => {
+    const target = dates[i] ? v.currentTime + (minDate - dates[i]) / 1000 : vodRef;
+    if (Math.abs(target - v.currentTime) < 0.05) return;
+    const done = new Promise(r => { v.addEventListener('seeked', r, { once: true }); setTimeout(r, 5000); });
+    v.currentTime = target;
+    return done;
+  }));
+  vids.forEach(v => v.play().catch(() => {}));
+};
+
+const init = new URLSearchParams(location.hash.slice(1));
+for (const s of init.getAll('s')) {
+  const [, key, version, url] = s.match(/^([^@|]+)@?([^|]*)\|(.*)$/) ?? [];
+  if (url) addTile(url, key, version);
+}
+sync();
+</script>
+</body>
+</html>
